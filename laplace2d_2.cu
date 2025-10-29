@@ -11,6 +11,7 @@
 #include <vector>
 #include <limits>
 #include <functional>
+#include <algorithm>
 
 #include <cuda_runtime.h>
 #include <thrust/reduce.h>
@@ -39,6 +40,9 @@
 #ifndef DTYPE_STR
 #define DTYPE_STR "fp64"
 #endif
+
+#define KERNEL_TAG /* #[kernel] */
+
 static constexpr const char* DTYPE = DTYPE_STR;
 
 // ====== Metrics ======
@@ -69,6 +73,7 @@ using ERR_T = REAL_T;
 #endif
 
 // ====== kernel ======
+KERNEL_TAG
 __global__ void jacobi_step(int imax, int jmax,
                             const REAL_T* __restrict__ A,
                             REAL_T* __restrict__ Anew,
@@ -98,16 +103,13 @@ __global__ void jacobi_step(int imax, int jmax,
 #endif
 }
 
-// ====== time one kernel call with cudaEvent ======
-static float time_single_call_ms(std::function<void()> fn){
-    cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
-    cudaEventRecord(a, 0);
-    fn();
-    cudaEventRecord(b, 0);
-    cudaEventSynchronize(b);
-    float ms=0.f; cudaEventElapsedTime(&ms,a,b);
-    cudaEventDestroy(a); cudaEventDestroy(b);
-    return ms;
+// ====== helpers ======
+static inline bool is_valid_block(int bx, int by){
+    long long t = 1LL * bx * by;
+    if (bx <= 0 || by <= 0) return false;
+    if (t > 1024) return false;
+    if ((t % 32) != 0) return false;   // full warps
+    return true;
 }
 
 int main(int argc, const char** argv)
@@ -117,10 +119,9 @@ int main(int argc, const char** argv)
   int imax = 4096;
   int iter_max = 100;
 
-  // CLI for block/tuning
+  // CLI
   int bx = 1024, by = 1;
-  int tune_reps = 20;         // iterations per candidate for timing
-  int check_every = 5;       // error reduction cadence
+  int check_every = 5;
   const char* bx_list_arg = nullptr;
   const char* by_list_arg = nullptr;
 
@@ -133,7 +134,6 @@ int main(int argc, const char** argv)
     else if (strncmp(argv[i], "--by=", 5) == 0)            by = atoi(argv[i] + 5);
     else if (strncmp(argv[i], "--bx-list=", 10) == 0)      bx_list_arg = argv[i] + 10;
     else if (strncmp(argv[i], "--by-list=", 10) == 0)      by_list_arg = argv[i] + 10;
-    else if (strncmp(argv[i], "--tune-reps=", 12) == 0)    tune_reps = atoi(argv[i] + 12);
     else if (strncmp(argv[i], "--check-every=", 14) == 0)  check_every = atoi(argv[i] + 14);
   }
 #endif
@@ -149,17 +149,8 @@ int main(int argc, const char** argv)
   std::vector<int> bx_list = split_csv(bx_list_arg);
   std::vector<int> by_list = split_csv(by_list_arg);
 
-  // === Validation: require total threads multiple of 32 (full warps) and <= 1024 ===
-  auto is_valid_block = [](int bx_, int by_) -> bool {
-      long long t = 1LL * bx_ * by_;
-      if (bx_ <= 0 || by_ <= 0) return false;
-      if (t > 1024) return false;
-      if ((t % 32) != 0) return false;  // multiple of 32 threads
-      return true;
-  };
-
+  // Validate compile-time block if fixed
 #if USE_FIXED_BLOCK
-  // Validate compile-time block as well
   if (!is_valid_block(bx, by)) {
       fprintf(stderr,
               "ERROR: compile-time block (%d,%d) invalid. "
@@ -180,18 +171,6 @@ int main(int argc, const char** argv)
   // Boundary setup
   const double pi_d  = 2.0 * asin(1.0);
   const double tol_d = 2.5e-3;
-
-    // ====== Adaptive tolerance depending on precision type ======
-  // double tol_d;
-  // if (strcmp(DTYPE, "fp64") == 0)
-  //     tol_d = 2.5e-3;     // double precision: can converge very tightly
-  // else if (strcmp(DTYPE, "fp32") == 0)
-  //     tol_d = 2.5e-4;     // single precision: reasonable threshold
-  // else if (strcmp(DTYPE, "fp16") == 0)
-  //     tol_d = 1.2e-2;     // half precision: larger rounding noise
-  // else
-  //     tol_d = 2.5e-3;   // fallback (shouldn't happen)
-
 
   REAL_T *A    = new REAL_T[(size_t)(imax+2) * (jmax+2)];
   REAL_T *Anew = new REAL_T[(size_t)(imax+2) * (jmax+2)];
@@ -226,135 +205,103 @@ int main(int argc, const char** argv)
   cudaMemcpy(d_Anew, Anew, N*sizeof(REAL_T), cudaMemcpyHostToDevice);
   cudaMemset(d_err, 0, N*sizeof(ERR_T));
 
-  // ====== Build candidate list (enforcing multiple-of-32 total threads) ======
+  // ====== Build candidate list (multiple-of-32 total threads) ======
   std::vector<std::pair<int,int>> cand;
   if (!bx_list.empty() && !by_list.empty()){
-      for(int bx_:bx_list) for(int by_:by_list)
-          if (is_valid_block(bx_, by_)) cand.push_back({bx_,by_});
+      for (int bx_ : bx_list)
+          for (int by_ : by_list)
+              if (is_valid_block(bx_, by_)) cand.push_back({bx_, by_});
   } else {
-      if (is_valid_block(bx, by)) cand.push_back({bx,by});
-      else cand.push_back({256,4}); // safe fallback = 1024 threads
+      if (is_valid_block(bx, by)) cand.push_back({bx, by});
+      else cand.push_back({256, 4}); // fallback = 1024 threads
   }
-  if (cand.empty()) { cand.push_back({256,4}); }
+  if (cand.empty()) cand.push_back({256, 4});
 
-  // ====== Tuning on TEMP STATE (state-preserving) ======
-  REAL_T *d_A0, *d_Anew0;
-  cudaMalloc(&d_A0, N*sizeof(REAL_T));
-  cudaMalloc(&d_Anew0, N*sizeof(REAL_T));
-  cudaMemcpy(d_A0, d_A, N*sizeof(REAL_T), cudaMemcpyDeviceToDevice);
-  cudaMemcpy(d_Anew0, d_Anew, N*sizeof(REAL_T), cudaMemcpyDeviceToDevice);
-  ERR_T *d_err_tune; cudaMalloc(&d_err_tune, N*sizeof(ERR_T));
-  cudaMemset(d_err_tune, 0, N*sizeof(ERR_T));
+  // ====== Online tuning across first |cand| iterations (exactly 1 kernel per iteration) ======
+  struct Acc { double time_ms=0.0; double gflops=0.0; double bw=0.0; };
+  std::vector<Acc> acc(cand.size(), Acc{});
 
-  struct Acc { double time_ms=0.0; int reps=0; double gflops=0.0; double bw=0.0; };
-  std::vector<Acc> acc(cand.size());
-
-  for (size_t ci=0; ci<cand.size(); ++ci){
-      int bx_ = cand[ci].first, by_ = cand[ci].second;
-      dim3 block(bx_,by_);
-      dim3 grid((imax+block.x-1)/block.x,(jmax+block.y-1)/block.y);
-
-      // reset temp state for fair comparison
-      cudaMemcpy(d_A,    d_A0,    N*sizeof(REAL_T), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(d_Anew, d_Anew0, N*sizeof(REAL_T), cudaMemcpyDeviceToDevice);
-      cudaMemset(d_err_tune, 0, N*sizeof(ERR_T));
-
-      // time tune_reps iterations (pure perf)
-      float ms = time_single_call_ms([&](){
-          for(int r=0;r<tune_reps;++r){
-              jacobi_step<<<grid,block>>>(imax,jmax,d_A,d_Anew,d_err_tune);
-              REAL_T* tmp=d_A; d_A=d_Anew; d_Anew=tmp;
-          }
-      });
-
-      double sec = ms/1000.0;
-      double points=(imax+2.0)*(jmax+2.0);
-      double gflops=FLOPS_PER_POINT*points*tune_reps/(sec*1e9);
-      double BW=5.0*sizeof(REAL_T)*points*tune_reps/(sec*1e9);
-
-      acc[ci].time_ms = ms;
-      acc[ci].reps    = tune_reps;
-      acc[ci].gflops  = gflops;
-      acc[ci].bw      = BW;
-
-      double avg_iter_ms = ms / tune_reps;
-
-      // Print & log SUMMARY.
-      printf("SUMMARY imax=%d jmax=%d dtype=%s flops_per_pt=%.0f points=%s "
-             "bx=%d by=%d time_ms=%.3f iters=%d gflops=%.9f bandwidth_GBps=%.9f avg_iter_ms=%.6f "
-             "suggested_block_threads=%d num_regs=%d min_grid_size=%d static_smem_B=%d\n",
-             imax, jmax, DTYPE, FLOPS_PER_POINT, POINTS_MODE,
-             bx_, by_, ms, tune_reps, gflops, BW, avg_iter_ms,
-             suggested_block_threads, num_regs_per_thread, min_grid_size, static_smem_bytes);
-
-      std::ofstream out("jacobi_log.txt",std::ios::app);
-      if(out){
-          out<<std::fixed<<std::setprecision(9)
-             <<"SUMMARY imax="<<imax<<" jmax="<<jmax<<" dtype="<<DTYPE
-             <<" flops_per_pt="<<FLOPS_PER_POINT<<" points="<<POINTS_MODE
-             <<" bx="<<bx_<<" by="<<by_
-             <<" time_ms="<<std::setprecision(3)<<ms
-             <<" iters="<<tune_reps
-             <<" gflops="<<std::setprecision(9)<<gflops
-             <<" bandwidth_GBps="<<BW
-             <<" avg_iter_ms="<<std::setprecision(6)<<avg_iter_ms
-             <<" suggested_block_threads="<<suggested_block_threads
-             <<" num_regs="<<num_regs_per_thread
-             <<" min_grid_size="<<min_grid_size
-             <<" static_smem_B="<<static_smem_bytes
-             <<"\n";
-      }
-  }
-
-  // pick best by GFLOPS (ties broken by lower time)
+  int cur_cand = 0;
+  bool tuned = (cand.size() == 1);
   int best_i = 0;
-  for (int i=1;i<(int)cand.size();++i){
-      if (acc[i].gflops > acc[best_i].gflops ||
-          (fabs(acc[i].gflops - acc[best_i].gflops) < 1e-9 && acc[i].time_ms < acc[best_i].time_ms))
-          best_i = i;
-  }
-  int best_bx = cand[best_i].first;
-  int best_by = cand[best_i].second;
 
-  printf("\nGLOBAL_BEST imax=%d jmax=%d dtype=%s bx=%d by=%d gflops=%.9f bandwidth_GBps=%.9f time_ms=%.3f\n",
-         imax, jmax, DTYPE, best_bx, best_by, acc[best_i].gflops, acc[best_i].bw, acc[best_i].time_ms);
-
-  {
-      std::ofstream out2("jacobi_log.txt",std::ios::app);
-      if(out2){
-          out2<<std::fixed
-              <<"\nGLOBAL_BEST imax="<<imax<<" jmax="<<jmax<<" dtype="<<DTYPE
-              <<" bx="<<best_bx<<" by="<<best_by
-              <<" gflops="<<std::setprecision(9)<<acc[best_i].gflops
-              <<" bandwidth_GBps="<<acc[best_i].bw
-              <<" time_ms="<<std::setprecision(3)<<acc[best_i].time_ms
-              <<"\n";
-      }
-  }
-
-  // ====== Main solve with best block ======
-  dim3 block(best_bx, best_by);
-  dim3 grid((imax+block.x-1)/block.x,(jmax+block.y-1)/block.y);
-
-  // RESET state before the real solve
-  cudaMemcpy(d_A,    d_A0,    N*sizeof(REAL_T), cudaMemcpyDeviceToDevice);
-  cudaMemcpy(d_Anew, d_Anew0, N*sizeof(REAL_T), cudaMemcpyDeviceToDevice);
-  cudaMemset(d_err,  0,       N*sizeof(ERR_T));
+  // Start with first candidate
+  int cur_bx = cand[0].first;
+  int cur_by = cand[0].second;
+  dim3 block(cur_bx, cur_by);
+  dim3 grid((imax+block.x-1)/block.x, (jmax+block.y-1)/block.y);
 
   REAL_T error_val = real_from_double(1.0);
   int iter=0, k=0;
   bool printed_e0 = false;
 
-  // samples for optional fit (kept as in previous version)
   std::vector<double> err_samples_iter;
   std::vector<double> err_samples_value;
 
   auto t0=std::chrono::high_resolution_clock::now();
-  while((double)error_val > tol_d && iter < iter_max){
-      jacobi_step<<<grid,block>>>(imax,jmax,d_A,d_Anew,d_err);
-      std::swap(d_A,d_Anew); ++iter; ++k;
+  while ((double)error_val > tol_d && iter < iter_max) {
 
-      // print "0, ..." once (without extra kernel), right after first iter
+      // If still tuning, set block from current candidate
+      if (!tuned) {
+        cur_bx = cand[cur_cand].first;
+        cur_by = cand[cur_cand].second;
+        block  = dim3(cur_bx, cur_by);
+        grid   = dim3((imax+block.x-1)/block.x, (jmax+block.y-1)/block.y);
+      }
+
+      // ---- Exactly ONE kernel launch this iteration; measure it with events ----
+      cudaEvent_t ev_start, ev_stop;
+      cudaEventCreate(&ev_start);
+      cudaEventCreate(&ev_stop);
+      cudaEventRecord(ev_start, 0);
+
+      jacobi_step<<<grid, block>>>(imax, jmax, d_A, d_Anew, d_err);
+      std::swap(d_A, d_Anew);
+
+      cudaEventRecord(ev_stop, 0);
+      cudaEventSynchronize(ev_stop);
+      float iter_ms = 0.f;
+      cudaEventElapsedTime(&iter_ms, ev_start, ev_stop);
+      cudaEventDestroy(ev_start);
+      cudaEventDestroy(ev_stop);
+
+      ++iter; ++k;
+
+      // If tuning, record performance for this candidate (based on this single iteration)
+      if (!tuned) {
+          double points = (imax + 2.0) * (jmax + 2.0);
+          double sec    = iter_ms / 1000.0;
+          double gflops = FLOPS_PER_POINT * points / (sec * 1e9);
+          double BW     = 5.0 * sizeof(REAL_T) * points / (sec * 1e9);
+          acc[cur_cand].time_ms = iter_ms;
+          acc[cur_cand].gflops  = gflops;
+          acc[cur_cand].bw      = BW;
+
+          printf("TUNE iter=%d  cand=%d bx=%d by=%d  time_ms=%.3f  gflops=%.3f  BW=%.3f GB/s\n",
+                 iter, cur_cand, cur_bx, cur_by, iter_ms, gflops, BW);
+
+          // Advance candidate and finalize if done
+          ++cur_cand;
+          if (cur_cand >= (int)cand.size()) {
+              // Select best by GFLOPS, tie by lower time
+              best_i = 0;
+              for (int i=1; i<(int)cand.size(); ++i) {
+                  if (acc[i].gflops > acc[best_i].gflops ||
+                      (fabs(acc[i].gflops - acc[best_i].gflops) < 1e-9 &&
+                       acc[i].time_ms < acc[best_i].time_ms)) best_i = i;
+              }
+              cur_bx = cand[best_i].first;
+              cur_by = cand[best_i].second;
+              block  = dim3(cur_bx, cur_by);
+              grid   = dim3((imax+block.x-1)/block.x, (jmax+block.y-1)/block.y);
+              tuned  = true;
+
+              printf("\nGLOBAL_BEST (online) bx=%d by=%d  gflops=%.3f  BW=%.3f GB/s  time_ms=%.3f\n\n",
+                     cur_bx, cur_by, acc[best_i].gflops, acc[best_i].bw, acc[best_i].time_ms);
+          }
+      }
+
+      // Print "0, ..." once after the first iteration (same behavior as original)
       if (iter == 1 && !printed_e0){
           ERR_T e0 = thrust::reduce(thrust::device_pointer_cast(d_err),
                                     thrust::device_pointer_cast(d_err+N),
@@ -363,6 +310,7 @@ int main(int argc, const char** argv)
           printed_e0 = true;
       }
 
+      // Error check cadence (unchanged)
       if (k == check_every || iter == iter_max){
           ERR_T max_err = thrust::reduce(thrust::device_pointer_cast(d_err),
                                          thrust::device_pointer_cast(d_err+N),
@@ -378,17 +326,19 @@ int main(int argc, const char** argv)
           }
       }
   }
+
+
   cudaDeviceSynchronize();
   auto t1=std::chrono::high_resolution_clock::now();
   double time_ms=std::chrono::duration<double,std::milli>(t1-t0).count();
 
-  // Final metrics
+  // Final metrics (include tuning iterations)
   double points=(imax+2.0)*(jmax+2.0);
   double gflops=FLOPS_PER_POINT*points*iter/((time_ms/1000.0)*1e9);
   double BW=5.0*sizeof(REAL_T)*points*iter/((time_ms/1000.0)*1e9);
 
   printf("FINAL bx=%d by=%d iters=%d gflops=%.3f BW=%.3f GB/s time_ms=%.2f\n",
-         best_bx,best_by,iter,gflops,BW,time_ms);
+         cur_bx, cur_by, iter, gflops, BW, time_ms);
 
   bool converged = ((double)error_val <= tol_d);
 
@@ -430,7 +380,7 @@ int main(int argc, const char** argv)
       std::ofstream out("jacobi_log.txt",std::ios::app);
       if(out){
           out<<std::fixed<<std::setprecision(3)
-             <<"FINAL bx="<<best_bx<<" by="<<best_by<<" iters="<<iter
+             <<"FINAL bx="<<cur_bx<<" by="<<cur_by<<" iters="<<iter
              <<" gflops="<<gflops<<" BW="<<BW<<" time_ms="<<time_ms<<"\n";
           out<<std::setprecision(9)
              <<"expected_final="<<expected_final<<" error_final="<<(double)error_val<<"\n";
@@ -441,11 +391,10 @@ int main(int argc, const char** argv)
   }
 
 #if USE_FIXED_BLOCK
-  printf("Using FIXED block (compile-time) bx=%d by=%d\n",best_bx,best_by);
+  printf("Using FIXED block (compile-time) bx=%d by=%d\n", cur_bx, cur_by);
 #endif
 
   // Cleanup
-  cudaFree(d_A0); cudaFree(d_Anew0); cudaFree(d_err_tune);
   cudaFree(d_A); cudaFree(d_Anew); cudaFree(d_err);
   delete[] A; delete[] Anew;
 
